@@ -1,0 +1,12 @@
+# secrets & runtime state — never commit
+tokens.json
+config.json
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# client image output
+gw-images/

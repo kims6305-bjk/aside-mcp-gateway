@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Copy to ~/Library/LaunchAgents/com.example.aside-mcp-gateway.plist,
+     replace /path/to/aside-mcp-gateway (3 places), then:
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.aside-mcp-gateway.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.aside-mcp-gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/path/to/aside-mcp-gateway/gateway.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/aside-mcp-gateway</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/path/to/aside-mcp-gateway/logs/gateway.err.log</string>
+</dict>
+</plist>

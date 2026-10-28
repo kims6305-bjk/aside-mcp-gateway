@@ -81,13 +81,11 @@ same process and JS scope (`X-Aside-Session-Resumed: true` confirms it).
 
 - Real logins: `fetch` carries cookies, `fs` can write. Never exfiltrate page
   content, cookies or files.
-- Every `repl` call is classified read / write / destructive. Destructive code
-  (file deletion, payment/checkout, send/publish/submit, `eval`, external
-  POST/PUT/DELETE, reads of secret paths such as `.ssh`/`.env`/`tokens.json`)
-  is **blocked**: you get error `-32010` with an `approval_id`, and the
+- Every `repl` call is **held for approval** (the reason lists matched patterns
+  such as deletion, payment, send/submit, `eval`, secret paths): you get error `-32010` with an `approval_id`, and the
   operator alone receives a 6-digit code on Telegram. You never see the code.
 - Then tell the operator exactly what is blocked and wait. Retry the same call
-  with `_approval_id` (plus `_approval` if the operator gives you the code).
+  in the same session with `_approval_id` once the operator approves.
   Do not try to obtain the code any other way — that is the attack the gate
   exists to stop.
 - Never submit payments, send messages/posts, delete data or press final

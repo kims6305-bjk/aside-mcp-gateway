@@ -11,10 +11,10 @@ Phase 2: named sessions (X-Aside-Session header resumes the same child
          gateway tools running on dedicated child processes), completion
          notifications via an optional GitHub-issue bridge with an
          outbox-file fallback.
-Phase 3: safety gate — every `repl` call's code is classified
-         read/write/destructive by pattern analysis; destructive calls
-         need a one-time approval code delivered out-of-band (Telegram DM
-         only; POST /approve or retry with _approval). URL denylist hard
+Phase 3: safety gate — arbitrary `repl` code requires a one-time approval
+         delivered out-of-band (direct Telegram; approver-only POST /approve).
+         Pattern analysis supplies reasons, never proof of read-only behavior.
+         URL denylist hard
          blocks. Preview cache: the latest screenshot from any session is
          kept and served via aside_preview_latest / GET /preview.jpg.
          One synthesized read-only tool: browser_list_tabs.
@@ -34,6 +34,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -60,6 +61,10 @@ STARTED_AT = time.time()
 GATE_CFG = CONFIG.get("gate", {}) or {}
 GATE_DEFAULT_MODE = GATE_CFG.get("default_mode", "approve-destructive")
 APPROVAL_TTL_SEC = int(GATE_CFG.get("approval_ttl_sec", 600))
+# UNVERIFIED policy limits: bounded resource use and approver typo budget;
+# these are conservative choices, not measured security guarantees.
+MAX_REQUEST_BYTES = 1024 * 1024
+MAX_APPROVAL_ATTEMPTS = 5
 DENYLIST_PATTERNS = [re.compile(p, re.I) for p in GATE_CFG.get("denylist_url_patterns", [])]
 NOTIFY_CFG = CONFIG.get("notify", {}) or {}
 BRIDGE_REPO = NOTIFY_CFG.get("bridge_repo", "")  # "owner/repo" to enable; empty = outbox only
@@ -220,11 +225,9 @@ def classify_code(code):
             reasons.append(why)
     if reasons:
         return "destructive", reasons
-    if any(re.search(p, code) for p in _WRITE_PATTERNS):
-        return "write", ["side-effect api"]
-    if any(re.search(p, code) for p in _READ_PATTERNS):
-        return "read", ["read-only api"]
-    return "write", ["unclassified -> write"]
+    # Arbitrary JavaScript cannot be proven read-only by substring matching:
+    # aliases, computed properties and escaped paths bypass every deny pattern.
+    return "destructive", ["arbitrary code requires approval"]
 
 
 def denylist_hit(code):
@@ -238,18 +241,20 @@ def denylist_hit(code):
 
 # approvals: approval_id -> record
 APPROVALS = {}
-APPROVALS_LOCK = threading.Lock()
+APPROVALS_LOCK = threading.RLock()
 
 
-def new_approval(client_name, code, title):
+def new_approval(client_name, code, title, owner=None, context=None):
     aid = uuid.uuid4().hex[:12]
     acode = f"{secrets.randbelow(1000000):06d}"
     rec = {
         "id": aid, "code": acode, "client": client_name,
+        "owner": owner or client_name, "attempts": 0,
+        "context": context,
         "code_sha": hashlib.sha256((code or "").encode()).hexdigest(),
         "title": title or "",
         "preview": (code or "")[:200],
-        "status": "pending",
+        "status": "delivering",
         "expires": time.time() + APPROVAL_TTL_SEC,
     }
     with APPROVALS_LOCK:
@@ -257,14 +262,14 @@ def new_approval(client_name, code, title):
     return rec
 
 
-def approval_state(rec, client_name, code):
+def approval_state(rec, client_name, code, context=None):
     """-> 'ok' (consume) | 'pending' | 'mismatch' | 'expired'"""
     if rec is None:
         return "mismatch"
-    if time.time() > rec["expires"]:
+    if time.time() >= rec["expires"]:
         rec["status"] = "expired"
         return "expired"
-    if rec["client"] != client_name:
+    if rec["owner"] != client_name or rec["context"] != context:
         return "mismatch"
     if rec["code_sha"] != hashlib.sha256((code or "").encode()).hexdigest():
         return "mismatch"
@@ -391,7 +396,7 @@ class ChildSession:
 
 
 SESSIONS = {}       # sid -> {"child", "name", "client"}
-NAMED = {}          # (client, name) -> sid
+NAMED = {}          # (token principal, name) -> sid
 SESSIONS_LOCK = threading.Lock()
 
 # jobs: job_id -> record
@@ -414,6 +419,107 @@ def cache_preview(client_name, result):
                     "data": block["data"],
                     "mimeType": block.get("mimeType", "image/jpeg"),
                 }
+
+
+# ---------------------------------------------------------------- mjpeg live preview
+# GET /preview.mjpeg?session=<name>&token=<token> streams multipart frames.
+# A background loop screenshots the target named session every
+# preview.mjpeg_interval_sec seconds (slideshow-grade, not video: each real
+# screenshot takes a few seconds). The loop runs only while >=1 viewer is
+# connected. First viewer wins if several sessions are requested.
+MJPEG = {"viewers": 0, "session": None, "client": None,
+         "thread": None, "stop": threading.Event()}
+MJPEG_LOCK = threading.Lock()
+MJPEG_FRAME = {"data": None, "mime": "image/jpeg", "ts": 0.0}
+MJPEG_FRAME_LOCK = threading.Lock()
+
+# marker comment: tests/mock_mcp.py returns an image block when the code
+# contains MAKE_IMAGE (the real aside mcp ignores the comment).
+MJPEG_SHOT_CODE = (
+    "// MAKE_IMAGE\n"
+    "const __mjpegShot = await page.screenshot();\n"
+    "display(__mjpegShot);\n"
+    "console.log('mjpeg-frame');"
+)
+
+
+def _mjpeg_resolve_child():
+    with MJPEG_LOCK:
+        name, cname = MJPEG["session"], MJPEG["client"]
+    with SESSIONS_LOCK:
+        sid = NAMED.get((cname, name)) if name else None
+        if sid is None and not name:
+            # no session requested: most recently used session wins
+            best, best_ts = None, -1
+            for s in SESSIONS.values():
+                if s["owner"] != cname:
+                    continue
+                try:
+                    ts = s["child"].last_used
+                except Exception:
+                    ts = -1
+                if ts > best_ts:
+                    best, best_ts = s["child"], ts
+            return best if best_ts >= 0 else None
+        sess = SESSIONS.get(sid) if sid else None
+        return sess["child"] if sess else None
+
+
+def _mjpeg_loop():
+    interval = int((CONFIG.get("preview", {}) or {}).get("mjpeg_interval_sec", 5))
+    audit({"event": "mjpeg_loop_start"})
+    try:
+        while not MJPEG["stop"].is_set():
+            with MJPEG_LOCK:
+                if MJPEG["viewers"] <= 0:
+                    break
+            child = _mjpeg_resolve_child()
+            if child is None:
+                time.sleep(2)
+                continue
+            try:
+                resp = child.call_repl("mjpeg-frame", MJPEG_SHOT_CODE, rid=4242)
+                result = (resp or {}).get("result")
+                if result:
+                    import base64 as b64
+                    for block in result.get("content", []) or []:
+                        if isinstance(block, dict) and block.get("type") == "image" \
+                                and block.get("data"):
+                            raw = b64.b64decode(block["data"])
+                            with MJPEG_FRAME_LOCK:
+                                MJPEG_FRAME.update(
+                                    data=raw,
+                                    mime=block.get("mimeType", "image/jpeg"),
+                                    ts=time.time())
+                            break
+            except Exception as e:
+                audit({"event": "mjpeg_shot_failed", "err": type(e).__name__})
+            time.sleep(interval)
+    finally:
+        audit({"event": "mjpeg_loop_stop"})
+        with MJPEG_LOCK:
+            MJPEG["thread"] = None
+
+
+def mjpeg_viewer_open(session_name, client_name):
+    with MJPEG_LOCK:
+        first = MJPEG["viewers"] == 0
+        if first:
+            MJPEG["session"] = session_name
+            MJPEG["client"] = client_name
+            MJPEG["stop"].clear()
+        MJPEG["viewers"] += 1
+        if first or MJPEG["thread"] is None or not MJPEG["thread"].is_alive():
+            MJPEG["thread"] = threading.Thread(target=_mjpeg_loop, daemon=True)
+            MJPEG["thread"].start()
+        return first
+
+
+def mjpeg_viewer_close():
+    with MJPEG_LOCK:
+        MJPEG["viewers"] = max(0, MJPEG["viewers"] - 1)
+        if MJPEG["viewers"] == 0:
+            MJPEG["stop"].set()
 
 
 def run_job(job_id):
@@ -492,7 +598,7 @@ def reap_idle_sessions():
             for sid in stale:
                 sess = SESSIONS.pop(sid)
                 if sess.get("name"):
-                    NAMED.pop((sess["client"], sess["name"]), None)
+                    NAMED.pop((sess["owner"], sess["name"]), None)
                 victims.append(sess)
         for s in victims:
             audit({"event": "session_reaped", "client": s["client"]})
@@ -535,18 +641,72 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
 
-    def _auth_client(self):
+    def _auth_client(self, allow_query_token=False):
         auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
+        token = None
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):].strip()
+        elif allow_query_token:
+            # for <img>/browser viewers that cannot set headers (mjpeg only)
+            qs = parse_qs(urlparse(self.path).query)
+            vals = qs.get("token") or []
+            token = vals[0].strip() if vals else None
+        if not token:
             return None
-        token = auth[len("Bearer "):].strip()
         info = load_clients().get(token)
         if info is None:
             return None
-        return info
+        # Display names are not identities: different tokens may share a name.
+        return dict(info, principal=hashlib.sha256(token.encode()).hexdigest())
 
     # -- routes
     def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/preview.mjpeg":
+            client = self._auth_client(allow_query_token=True)
+            if not client:
+                self._send_json(401, rpc_error(None, -32001, "unauthorized"))
+                return
+            qs = parse_qs(parsed.query)
+            session_name = (qs.get("session") or [None])[0]
+            cname = client["principal"]
+            # resolve now so we fail fast with 404 instead of a hanging stream
+            with SESSIONS_LOCK:
+                sid = NAMED.get((cname, session_name)) if session_name else None
+                ok = (sid in SESSIONS) if session_name else any(
+                    s["owner"] == cname for s in SESSIONS.values())
+            if not ok:
+                self._send_json(
+                    404, rpc_error(None, -32000,
+                                   "no such session; create it first (X-Aside-Session)"))
+                return
+            mjpeg_viewer_open(session_name, cname)
+            try:
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "multipart/x-mixed-replace; boundary=mjpegframe")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                last_ts = 0.0
+                while True:
+                    with MJPEG_FRAME_LOCK:
+                        data, mime, ts = (MJPEG_FRAME["data"],
+                                          MJPEG_FRAME["mime"],
+                                          MJPEG_FRAME["ts"])
+                    if data and ts != last_ts:
+                        last_ts = ts
+                        head = (f"--mjpegframe\r\nContent-Type: {mime}\r\n"
+                                f"Content-Length: {len(data)}\r\n\r\n").encode()
+                        self.wfile.write(head + data + b"\r\n")
+                        self.wfile.flush()
+                    else:
+                        time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                mjpeg_viewer_close()
+            return
         if self.path == "/healthz":
             with SESSIONS_LOCK:
                 n = len(SESSIONS)
@@ -600,13 +760,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         sid = self.headers.get("Mcp-Session-Id")
         with SESSIONS_LOCK:
+            sess = SESSIONS.get(sid)
+            if sess and sess["owner"] != client["principal"]:
+                self._send_json(403, rpc_error(None, -32001, "session owner mismatch"))
+                return
             sess = SESSIONS.pop(sid, None)
             if sess and sess.get("name"):
-                NAMED.pop((sess["client"], sess["name"]), None)
+                NAMED.pop((sess["owner"], sess["name"]), None)
         if sess:
             sess["child"].terminate()
             audit({"event": "session_closed", "client": client["name"]})
         self._send_json(200, {"ok": True})
+
+    def _read_json(self):
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or self.headers.get("Transfer-Encoding"):
+            raise ValueError("ambiguous framing")
+        length = int(lengths[0])
+        if not 0 < length <= MAX_REQUEST_BYTES:
+            raise ValueError("invalid body length")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("incomplete body")
+        return json.loads(raw.decode("utf-8"))
 
     def do_POST(self):
         if self.path == "/approve":
@@ -615,24 +791,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(401, rpc_error(None, -32001, "unauthorized"))
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                body = self._read_json()
+                if not isinstance(body, dict) or not isinstance(body.get("approval_id"), str) \
+                        or not isinstance(body.get("code"), str):
+                    raise ValueError("invalid approval fields")
             except Exception:
+                self.close_connection = True
                 self._send_json(400, {"ok": False, "error": "bad json"})
                 return
             with APPROVALS_LOCK:
                 rec = APPROVALS.get(body.get("approval_id", ""))
                 if client.get("role") == "approver" and rec \
-                        and rec["client"] != client["name"] \
-                        and rec["code"] == str(body.get("code", "")).strip() \
-                        and time.time() <= rec["expires"] \
+                        and rec["owner"] != client["principal"] \
+                        and time.time() < rec["expires"] \
                         and rec["status"] == "pending":
-                    rec["status"] = "approved"
-                    ok = True
+                    rec["attempts"] += 1
+                    ok = secrets.compare_digest(rec["code"].encode(), body["code"].strip().encode())
+                    if ok:
+                        rec["status"] = "approved"
+                    elif rec["attempts"] >= MAX_APPROVAL_ATTEMPTS:
+                        rec["status"] = "locked"
                 else:
                     ok = False
             audit({"event": "approval_decision", "client": client["name"],
-                   "approval_id": body.get("approval_id"), "ok": ok})
+                   "approval_id": rec["id"] if rec else None, "ok": ok})
             self._send_json(200 if ok else 403,
                             {"ok": ok, "status": "approved" if ok else "rejected"})
             return
@@ -648,9 +830,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(403, rpc_error(None, -32001, "approver token cannot call /mcp"))
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = self._read_json()
         except Exception:
+            self.close_connection = True
             self._send_json(400, rpc_error(None, -32700, "parse error"))
             return
         if isinstance(payload, list):
@@ -684,6 +866,8 @@ class Handler(BaseHTTPRequestHandler):
                              -32600, "invalid request"), None, None
         method = obj.get("method")
         rid = obj.get("id")
+        if not isinstance(method, str) or (rid is not None and type(rid) not in (str, int)):
+            return rpc_error(None, -32600, "invalid request"), None, None
         sid = self.headers.get("Mcp-Session-Id")
         cname = client["name"]
 
@@ -692,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
 
         with SESSIONS_LOCK:
             sess = SESSIONS.get(sid) if sid else None
-        if sess is None:
+        if sess is None or sess["owner"] != client["principal"]:
             return rpc_error(rid, -32000,
                              "unknown or missing Mcp-Session-Id (initialize first)"), None, None
         child = sess["child"]
@@ -710,9 +894,15 @@ class Handler(BaseHTTPRequestHandler):
             return resp, None, None
 
         if method == "tools/call":
-            params = obj.get("params") or {}
+            params = obj.get("params", {})
+            if not isinstance(params, dict):
+                return rpc_error(rid, -32602, "invalid params"), None, None
             tname = params.get("name")
-            args = params.get("arguments") or {}
+            args = params.get("arguments", {})
+            if not isinstance(tname, str) or not isinstance(args, dict) \
+                    or any(k in args and not isinstance(args[k], str)
+                           for k in ("code", "title", "_approval_id", "job_id")):
+                return rpc_error(rid, -32602, "invalid tool arguments"), None, None
             if tname in GATEWAY_TOOL_NAMES:
                 return {"jsonrpc": "2.0", "id": rid,
                         "result": self._gateway_tool(client, child, tname, args)}, None, None
@@ -720,6 +910,8 @@ class Handler(BaseHTTPRequestHandler):
                 gate_resp = self._gate_check(client, rid, args)
                 if gate_resp is not None:
                     return gate_resp, None, None
+            else:
+                return rpc_error(rid, -32601, "unsupported tool"), None, None
             audit({"client": cname, "method": method, "tool": tname,
                    "title": args.get("title"),
                    "code_len": len(args.get("code") or "")})
@@ -736,7 +928,7 @@ class Handler(BaseHTTPRequestHandler):
                 with SESSIONS_LOCK:
                     dead = SESSIONS.pop(sid, None)
                     if dead and dead.get("name"):
-                        NAMED.pop((dead["client"], dead["name"]), None)
+                        NAMED.pop((dead["owner"], dead["name"]), None)
                 return rpc_error(rid, -32003,
                                  "aside mcp process died; re-initialize"), None, None
             except TimeoutError as e:
@@ -744,6 +936,8 @@ class Handler(BaseHTTPRequestHandler):
             cache_preview(cname, (resp or {}).get("result"))
             return resp, None, None
 
+        if method not in ("notifications/initialized", "ping"):
+            return rpc_error(rid, -32601, "unsupported method"), None, None
         try:
             resp = child.request(obj)
         except Exception as e:
@@ -752,11 +946,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _initialize(self, client, obj):
         cname = client["name"]
+        owner = client["principal"]
         name = self.headers.get("X-Aside-Session")
         rid = obj.get("id")
         if name:
             with SESSIONS_LOCK:
-                old_sid = NAMED.get((cname, name))
+                old_sid = NAMED.get((owner, name))
                 sess = SESSIONS.get(old_sid) if old_sid else None
             if sess and sess["child"].alive:
                 audit({"event": "session_resumed", "client": cname, "name": name})
@@ -771,9 +966,9 @@ class Handler(BaseHTTPRequestHandler):
         child.init_resp = resp
         new_sid = uuid.uuid4().hex
         with SESSIONS_LOCK:
-            SESSIONS[new_sid] = {"child": child, "name": name, "client": cname}
+            SESSIONS[new_sid] = {"child": child, "name": name, "client": cname, "owner": owner}
             if name:
-                NAMED[(cname, name)] = new_sid
+                NAMED[(owner, name)] = new_sid
         audit({"event": "session_created", "client": cname, "name": name,
                "method": "initialize"})
         return resp, new_sid, {"X-Aside-Session-Resumed": "false"} if name else None
@@ -784,6 +979,8 @@ class Handler(BaseHTTPRequestHandler):
         code = args.get("code") or ""
         title = args.get("title")
         cname = client["name"]
+        owner = client["principal"]
+        context = self.headers.get("Mcp-Session-Id")
         hit = denylist_hit(code)
         if hit:
             audit({"event": "gate_blocked_denylist", "client": cname,
@@ -793,70 +990,64 @@ class Handler(BaseHTTPRequestHandler):
                              {"denylist": hit})
         level, reasons = classify_code(code)
         mode = client.get("gate", GATE_DEFAULT_MODE)
-        need = (level == "destructive" and mode in ("approve-destructive",
-                                                     "approve-write")) or \
-               (level == "write" and mode == "approve-write")
+        need = level in ("write", "destructive")
         audit({"event": "gate_classified", "client": cname, "title": title,
                "level": level, "reasons": reasons, "mode": mode,
                "approval_required": need})
-        if mode == "off" or not need:
+        if not need:
             return None
-        approval_arg = args.get("_approval")
         approval_id_arg = args.get("_approval_id")
         code_sha = hashlib.sha256(code.encode()).hexdigest()
         with APPROVALS_LOCK:
             rec = APPROVALS.get(approval_id_arg) if approval_id_arg else None
-            # retry carrying the code itself counts as approval
-            if rec is not None and approval_arg is not None \
-                    and str(approval_arg).strip() == rec["code"] \
-                    and rec["status"] == "pending" \
-                    and time.time() <= rec["expires"] \
-                    and rec["client"] == cname \
-                    and rec["code_sha"] == code_sha:
-                rec["status"] = "approved"
-            if rec is not None and approval_state(rec, cname, code) == "ok":
+            # Requester-supplied codes are never compared or accepted.
+            if rec is not None and approval_state(rec, owner, code, context) == "ok":
                 audit({"event": "gate_approved_execute", "client": cname,
                        "approval_id": rec["id"], "title": title})
                 return None
             # dedupe: reuse an existing pending approval for the same code
-            if rec is None or rec["status"] not in ("pending", "approved"):
-                for r in APPROVALS.values():
-                    if r["client"] == cname and r["code_sha"] == code_sha \
-                            and r["status"] == "pending" \
-                            and time.time() <= r["expires"]:
-                        rec = r
-                        break
-                else:
-                    rec = None
-        if rec is not None:
+            rec = next((r for r in APPROVALS.values()
+                        if r["owner"] == owner and r["code_sha"] == code_sha
+                        and r["context"] == context
+                        and r["status"] in ("delivering", "pending")
+                        and time.time() < r["expires"]), None)
+            created = rec is None
+            if created:
+                # Reservation and deduplication are one atomic operation.
+                rec = new_approval(cname, code, title, owner=owner, context=context)
+        if not created:
             return rpc_error(rid, -32010,
                              "approval required for destructive action",
                              {"approval_required": True,
                               "approval_id": rec["id"], "level": level,
                               "reasons": reasons,
                               "expires_in_sec": int(rec["expires"] - time.time()),
-                              "how": "Ask the user for the approval code (sent "
-                                     "via Telegram), then retry the same call "
-                                     "with _approval_id and _approval set, or "
-                                     "POST /approve."})
+                              "how": "Wait for approver-only POST /approve, then "
+                                     "retry the same call with _approval_id."})
         # not approved -> register a new pending approval + notify
-        rec = new_approval(cname, code, title)
-        delivered = tg_send(
-            f"🔐 aside gateway approval request\n"
-            f"- client: {cname} · {title or 'destructive action'}\n"
-            f"- reason: {', '.join(reasons)}\n"
-            f"- code preview: {rec['preview']}\n"
-            f"- Approval code: {rec['code']} (valid {APPROVAL_TTL_SEC // 60} min)\n\n"
-            f"To allow it, give this code to the requesting agent or run scripts/approve.py {rec['code']}. Ignore it and nothing runs.")
+        try:
+            delivered = tg_send(
+                f"🔐 aside gateway approval request\n"
+                f"- Approval code: {rec['code']} (valid {APPROVAL_TTL_SEC // 60} min)\n"
+                f"- approval_id: {rec['id']}\n"
+                f"- session: {context}\n"
+                f"- client: {cname[:100]} · {(title or 'destructive action')[:200]}\n"
+                f"- reason: {', '.join(reasons)}\n"
+                f"- code preview: {rec['preview']}\n"
+                f"- code SHA256: {rec['code_sha']}\n\n"
+                "To allow it, run scripts/approve.py <code> as the approver (POST /approve). "
+                "Never give this code to the requesting agent. Ignore it and nothing runs.")
+        except Exception:
+            delivered = False
+        with APPROVALS_LOCK:
+            rec["status"] = "pending" if delivered and time.time() < rec["expires"] else "expired"
         data = {"approval_required": True, "approval_id": rec["id"],
                 "level": level, "reasons": reasons,
                 "expires_in_sec": APPROVAL_TTL_SEC,
                 "how": "The approval code was sent to the user's Telegram only. "
-                       "Wait for the user, then retry the same call with "
-                       "_approval_id (and _approval if the user gave you the code)."}
+                       "Wait for approver-only POST /approve, then retry with _approval_id."}
         if not delivered:
             # fail closed: never hand the code to the requester
-            rec["status"] = "expired"
             data["warning"] = "telegram notify failed; approval impossible, ask the user"
             audit({"event": "gate_notify_failed_closed", "client": cname,
                    "approval_id": rec["id"]})

@@ -32,8 +32,8 @@ HTTP MCP server**:
 - Per-client Bearer token authentication
 - **Named sessions** (`X-Aside-Session` header): reconnect and keep the same browser session and JS scope
 - **Async jobs** (`aside_job_start/status/result`): fire a long task, collect the result later
-- **Safety gate**: every `repl` call is classified read/write/destructive. Destructive
-  calls **never run without the user's approval** (see Security model)
+- **Safety gate**: every `repl` call **needs the user's approval** to run. Pattern
+  analysis only labels the reason (see Security model)
 - **Preview**: latest screenshot via the `aside_preview_latest` tool and `/preview.jpg`
 
 ## When is it useful
@@ -66,11 +66,11 @@ app-wide, so a tab opened by one client can be continued by another.
 ### 5. "What if the agent pays for something by itself?" — the approval gate
 This is the main reason the project exists. Handing a whole browser to an agent
 is scary because of **irreversible actions**: payments, sending messages,
-deleting files. The safety gate analyzes the code pattern, grades it, stops
-destructive calls, and sends a **one-time approval code to the user's Telegram
+deleting files. The safety gate stops every `repl` call (code patterns only
+label the reason) and sends a **one-time approval code to the user's Telegram
 DM only**. The requesting agent can never see the code by design (a structure
 hardened after a self-approval hole found in an audit — see
-[docs/SECURITY.md](docs/SECURITY.md)). The user just passes the code on or runs `scripts/approve.py 123456`.
+[docs/SECURITY.md](docs/SECURITY.md)). The user runs `scripts/approve.py 123456` with the approver token — never hands the code to the agent.
 
 ### 6. Watching what the agent sees — preview
 When you want to see with your own eyes what the agent is looking at. Grab the
@@ -90,7 +90,7 @@ Claude Code / Desktop / ChatGPT(tunnel) / bot
 ┌─ aside-mcp-gateway (stdlib Python, resident) ─────────────────┐
 │  session mgmt (Mcp-Session-Id → child process)                │
 │  named sessions (X-Aside-Session) · async jobs                │
-│  safety gate (read/write/destructive classification+approval) │
+│  safety gate (every repl approved; patterns = reasons)        │
 │  preview cache (/preview.jpg, aside_preview_latest)          │
 └───────────────┬──────────────────────────────────────────────┘
                 │ stdio (one process = one session)
@@ -109,14 +109,18 @@ Claude Code / Desktop / ChatGPT(tunnel) / bot
   expose directly to the internet.
 - **Auth**: per-client Bearer tokens (`tokens.json`, mode 600). Rotate a single
   entry if a token leaks.
-- **Approval**: destructive code needs a one-time 6-digit code. The code is sent
+- **Approval**: every `repl` call needs a one-time 6-digit code (arbitrary JS cannot be
+  proven read-only by substring checks — aliases, computed properties and escapes
+  bypassed every deny pattern in testing). The code is sent
   to the user's Telegram DM **only** and never lands in any channel the
   requesting agent can read (issues, files, responses, logs). If Telegram
   delivery fails, the approval expires immediately (fail-closed). `/approve`
   accepts only `role: approver` tokens that are a **different party** from the
-  requester; approver tokens are blocked from `/mcp` (403).
-- **Least privilege**: per-token gate modes
-  (`approve-destructive` | `approve-write` | `off`).
+  requester; approver tokens are blocked from `/mcp` (403). An approval is bound
+  to the requesting token, session and code hash, works once, and locks after
+  repeated wrong codes.
+- **Session ownership**: named sessions, jobs and previews are usable and
+  deletable only by the token that created them.
 - **Denylist**: hard-blocked URL patterns (`gate.denylist_url_patterns`).
 - **Secret paths**: read attempts whose code mentions `tokens.json`,
   `.env`, `.ssh`, `.aws`, `Keychains`, etc. also require approval (string-splitting can
@@ -154,19 +158,19 @@ sequenceDiagram
     participant B as Aside browser
     participant U as Operator (Telegram)
     A->>G: repl {code: "...checkout()..."}
-    G->>G: classify → destructive
+    G->>G: hold (every repl needs approval)
     G-->>U: 🔐 approval request + 6-digit code (DM only)
     G-->>A: error -32010 {approval_id} (no code)
-    U->>G: POST /approve (approver token) or tells agent the code
+    U->>G: POST /approve (approver token)
     A->>G: retry with _approval_id
     G->>B: run once
     B-->>A: result
 ```
 
-1. Agent attempts a destructive action → gateway blocks it and returns an error
+1. Agent runs `repl` code → gateway holds it and returns an `approval_id`
 2. Your phone gets "🔐 aside gateway approval request" + 6-digit code on Telegram
-3. Tell the agent the code, or run `python3 scripts/approve.py <code>` (approver token)
-4. Agent retries the same call with `_approval_id` (+`_approval`) → runs once
+3. Run `python3 scripts/approve.py <code>` (approver token)
+4. Agent retries the same call in the same session with `_approval_id` → runs once
 
 Ignoring it means it never runs. Codes expire after 10 minutes (configurable).
 
@@ -180,7 +184,7 @@ Ignoring it means it never runs. Codes expire after 10 minutes (configurable).
 | `scripts/approve.py` | Operator approval CLI (approver token + the code from Telegram) |
 | `config.example.json` | Config example (real `config.json`/`tokens.json` stay on the deploy machine, excluded from git) |
 | `launchd/com.example.aside-mcp-gateway.plist` | launchd template (macOS, fix 3 paths) |
-| `tests/` | `mock_mcp.py` mock server + `test_http.py` + `test_phase23.py` + `test_gate_selfapprove.py` |
+| `tests/` | `mock_mcp.py` mock server + `test_http.py` + `test_phase23.py` + `test_gate_selfapprove.py` + `test_gate_redteam.py` |
 | `docs/SECURITY.md` | Threat model, approval principles, limits |
 | `QUICKSTART.md` | Third-party installation guide |
 

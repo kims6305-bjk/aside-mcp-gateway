@@ -27,8 +27,8 @@ Aside AI 브라우저를 Tailscale/VPN 안의 여러 AI 클라이언트(Claude C
 - 클라이언트별 Bearer 토큰 인증
 - **명명 세션** (`X-Aside-Session` 헤더): 재연결해도 같은 브라우저 세션·JS 스코프가 이어짐
 - **비동기 잡** (`aside_job_start/status/result`): 긴 작업을 맡겨놓고 나중에 결과만 받기
-- **안전 게이트**: 모든 `repl` 코드를 read/write/destructive로 분류. destructive는
-  **사용자 승인 없이는 절대 실행 안 됨** (아래 보안 모델 참조)
+- **안전 게이트**: 모든 `repl` 코드는 **사용자 승인 없이는 실행 안 됨**. 패턴 분석은
+  승인 요청에 사유를 붙이는 데만 쓴다 (아래 보안 모델 참조)
 - **미리보기**: 최신 스크린샷을 `aside_preview_latest` 도구·`/preview.jpg`로 제공
 
 ## 언제 유용하고, 어떨 때 쓰나요
@@ -60,11 +60,10 @@ Claude Code(집 PC), ChatGPT(터널 경유), 개인 봇 등 서로 다른
 ### 5. "에이전트가 멋대로 결제·발송하지 않을까" 걱정될 때 — 승인 게이트
 이게 이 프로젝트가 존재하는 가장 큰 이유다. 에이전트에게 브라우저를 통째로
 맡기면 결제·메시지 발송·파일 삭제 같은 **되돌릴 수 없는 행동**이 두렵다.
-안전 게이트는 코드 패턴을 분석해서 destructive 등급을 매기고, 해당 호출을
-멈춘 뒤 **사용자의 텔레그램 DM으로만 1회용 승인 코드**를 보낸다.
+안전 게이트는 모든 `repl` 호출을 멈추고(코드 패턴은 사유 표시용),  **사용자의 텔레그램 DM으로만 1회용 승인 코드**를 보낸다.
 요청 에이전트는 코드를 절대 볼 수 없게 설계되어 있다(감사에서 발견된 자기승인
-구멍을 막은 구조 — [docs/SECURITY.md](docs/SECURITY.md)). 사용자는 폰으로
-코드를 에이전트에게 알려주거나 `scripts/approve.py 123456`을 실행하면 된다.
+구멍을 막은 구조 — [docs/SECURITY.md](docs/SECURITY.md)). 사용자는 approver 토큰으로
+`scripts/approve.py 123456`을 실행하면 된다. 코드를 에이전트에게 알려주지 않는다.
 
 ### 6. 브라우저 화면을 실시간으로 보고 싶을 때 — 미리보기
 에이전트가 뭘 보고 있는지 사람이 직접 확인하고 싶을 때. `aside_preview_latest`
@@ -85,7 +84,7 @@ Claude Code / Desktop / ChatGPT(tunnel) / bot
 ┌─ aside-mcp-gateway (stdlib Python, 상주) ──────────────┐
 │  세션 관리 (Mcp-Session-Id → 자식 프로세스)              │
 │  명명 세션 (X-Aside-Session) · 비동기 잡                │
-│  안전 게이트 (read/write/destructive 분류 + 승인)        │
+│  안전 게이트 (모든 repl 승인 + 사유 패턴 표시)           │
 │  미리보기 캐시 (/preview.jpg, aside_preview_latest)     │
 └───────────────┬────────────────────────────────────────┘
                 │ stdio (프로세스 1개 = 세션 1개)
@@ -102,13 +101,14 @@ Claude Code / Desktop / ChatGPT(tunnel) / bot
 - **전송**: 기본 바인딩은 사설망 IP (예: Tailscale). 인터넷 직접 노출 금지.
 - **인증**: 클라이언트별 Bearer 토큰 (`tokens.json`, 600 권한). 토큰 유출 시 해당
   항목만 교체하면 된다.
-- **승인**: destructive 등급 코드는 1회용 6자리 코드 승인 필요. 코드는 사용자
+- **승인**: 모든 `repl` 코드는 1회용 6자리 코드 승인 필요(임의 JS는 문자열 검사로
+  읽기 전용임을 증명할 수 없기 때문 — 별칭·계산된 속성·이스케이프로 우회 실측). 코드는 사용자
   텔레그램 DM으로만 전송되며, 요청 에이전트가 읽을 수 있는 어떤 채널(이슈·파일·
   응답·로그)에도 남지 않는다. 텔레그램 전송 실패 시 해당 승인은 즉시 만료
   (fail-closed). `/approve`는 `role: approver` 토큰이면서 요청자와 다른 주체만
-  호출할 수 있고, approver 토큰은 `/mcp` 호출이 차단된다.
-- **최소 권한**: 토큰마다 게이트 모드를 다르게 설정 가능
-  (`approve-destructive` | `approve-write` | `off`).
+  호출할 수 있고, approver 토큰은 `/mcp` 호출이 차단된다. 승인은 요청 토큰·세션·코드
+  해시에 묶여 1회만 쓰이고, 코드 오답이 반복되면 해당 승인이 잠긴다.
+- **세션 소유권**: 명명 세션·잡·미리보기는 만든 토큰만 쓰고 지울 수 있다.
 - **denylist**: URL 패턴 하드 차단 (`gate.denylist_url_patterns`).
 - **비밀 경로**: 코드에 `tokens.json`, `.env`, `.ssh`, `.aws`, `Keychains` 같은
   문자열이 들어간 읽기 시도도 승인 대상으로 분류된다 (문자열 쪼개기 우회는
@@ -146,19 +146,19 @@ sequenceDiagram
     participant B as Aside browser
     participant U as Operator (Telegram)
     A->>G: repl {code: "...checkout()..."}
-    G->>G: classify → destructive
+    G->>G: hold (every repl needs approval)
     G-->>U: 🔐 approval request + 6-digit code (DM only)
     G-->>A: error -32010 {approval_id} (no code)
-    U->>G: POST /approve (approver token) or tells agent the code
+    U->>G: POST /approve (approver token)
     A->>G: retry with _approval_id
     G->>B: run once
     B-->>A: result
 ```
 
-1. 에이전트가 destructive 작업을 시도 → 게이트웨이가 차단하고 에러 반환
+1. 에이전트가 `repl` 코드를 실행하려 함 → 게이트웨이가 멈추고 `approval_id` 반환
 2. 사용자 폰의 텔레그램으로 "🔐 aside 게이트웨이 승인요청" + 6자리 코드 도착
-3. 사용자가 에이전트에게 코드를 알려주거나, `python3 scripts/approve.py <코드>`(approver 토큰) 실행
-4. 에이전트가 같은 호출을 `_approval_id`(+`_approval`)와 함께 재시도 → 1회 실행
+3. 사용자가 `python3 scripts/approve.py <코드>`(approver 토큰) 실행
+4. 에이전트가 같은 세션에서 같은 호출을 `_approval_id`와 함께 재시도 → 1회 실행
 
 무시하면 실행되지 않는다. 코드는 10분(설정 가능) 후 만료.
 
@@ -172,7 +172,7 @@ sequenceDiagram
 | `scripts/approve.py` | 운영자용 승인 CLI (approver 토큰, 텔레그램으로 받은 코드 입력) |
 | `config.example.json` | 설정 예시 (실제 `config.json`·`tokens.json`은 배포 머신에만, git 제외) |
 | `launchd/com.example.aside-mcp-gateway.plist` | launchd 등록 템플릿 (macOS, 경로 3곳 수정) |
-| `tests/` | `mock_mcp.py` 목 서버 + `test_http.py` + `test_phase23.py` + `test_gate_selfapprove.py` |
+| `tests/` | `mock_mcp.py` 목 서버 + `test_http.py` + `test_phase23.py` + `test_gate_selfapprove.py` + `test_gate_redteam.py` |
 | `docs/SECURITY.md` | 위협 모델·승인 원칙·한계 |
 | `QUICKSTART.md` | 타인용 설치 가이드 |
 

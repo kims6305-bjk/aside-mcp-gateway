@@ -14,8 +14,8 @@ step-by-step for third-party operators.
 | A private network between your clients and the server | The gateway controls a **real logged-in browser** — never expose it to the internet | [Tailscale](https://tailscale.com) (recommended), or any VPN / LAN |
 | A Telegram bot (for approvals) | Destructive actions need a one-time code delivered to **you** | [@BotFather](https://t.me/BotFather) → `/newbot` → save the token; then message your bot once and get your chat id via `https://api.telegram.org/bot<TOKEN>/getUpdates` |
 
-> Without a working Telegram setup the safety gate **fails closed**: destructive
-> calls are blocked and can never be approved. Read-only browsing still works.
+> Without a working Telegram setup the safety gate **fails closed**: `repl`
+> calls are blocked and can never be approved.
 
 ## 1. Clone and configure
 
@@ -37,7 +37,7 @@ Edit `config.json`:
   "idle_timeout_sec": 2100,   // child process reaped after 30 min idle
   "request_timeout_sec": 180,
   "gate": {
-    "default_mode": "approve-destructive",  // or "approve-write" / "off"
+    "default_mode": "approve-destructive",  // kept for compatibility; every repl needs approval
     "approval_ttl_sec": 600,
     "denylist_url_patterns": []
   },
@@ -67,7 +67,7 @@ section of `config.json` — same secrecy rules apply.)
 {
   "tokens": {
     "<random-string-1>": "my-laptop",
-    "<random-string-2>": { "name": "my-bot", "gate": "approve-write" },
+    "<random-string-2>": { "name": "my-bot" },
     "<random-string-3>": { "name": "approver", "role": "approver" }
   }
 }
@@ -75,7 +75,8 @@ section of `config.json` — same secrecy rules apply.)
 
 - Generate each token with e.g. `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`.
 - Plain string value = a normal client (uses the default gate mode).
-- `gate` can be `approve-destructive` (default), `approve-write`, or `off`.
+- Every `repl` call needs approval regardless of `gate`; the field is kept for
+  config compatibility only.
 - You need **one approver token** (`role: approver`): it is the only token
   allowed to call `POST /approve`, and it **cannot** call `/mcp` (403 by design).
   Keep its value somewhere safe — it never goes into the repo.
@@ -130,11 +131,10 @@ tool surface, the named-session header, and the approval flow.
 
 ## 5. How approval works (operator view)
 
-1. Agent runs a destructive snippet (file delete, payment, form submit, `eval`, …)
-   → gateway blocks it, returns `approval_required` + `approval_id`.
+1. Agent runs any `repl` snippet
+   → gateway holds it, returns `approval_required` + `approval_id`.
 2. Your Telegram gets: `🔐 aside gateway approval request` + 6-digit code.
-3. Either tell the agent the code (it retries with `_approval_id` + `_approval`),
-   or approve yourself with the approver token:
+3. Approve with the approver token (never give the code to the agent):
    `ASIDE_GW_URL=http://100.x.y.z:11441 ASIDE_APPROVER_TOKEN=<approver> python3 scripts/approve.py 123456`
    — then the agent retries with just `_approval_id`.
 4. The call runs **once**. Ignore it and nothing happens; the code expires in 10 min.
@@ -146,6 +146,7 @@ not in any file, not in the audit log — Telegram DM only.
 
 ```sh
 python3 tests/test_gate_selfapprove.py   # 13 checks: the approval-gate contract
+python3 tests/test_gate_redteam.py       # 28 checks: bypass attempts (aliases, races, session theft, brute force)
 python3 tests/test_phase23.py http://127.0.0.1:11441 <token> ./outbox
 python3 tests/test_http.py  http://127.0.0.1:11441 <token>
 ```
